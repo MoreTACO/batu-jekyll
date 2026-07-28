@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Boat Speedo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#071A2B">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Speedo">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-180.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<div id="alarm-banner" class="alarm-banner" hidden>
+  <div class="alarm-banner__text" id="alarm-text">ALARM</div>
+  <button type="button" class="alarm-banner__btn" id="alarm-ack">SILENCE</button>
+</div>
+
+<main class="app">
+
+  <header class="status" id="status">
+    <div class="status__item">
+      <span class="status__dot" id="fix-dot"></span>
+      <span id="fix-label">NO FIX</span>
+    </div>
+    <div class="status__item">&plusmn;<span id="accuracy">--</span> m</div>
+    <div class="status__item"><span id="fix-age">--</span></div>
+    <div class="status__item">
+      <span class="status__dot" id="wake-dot"></span>
+      <span id="wake-label">SCREEN</span>
+    </div>
+  </header>
+
+  <section class="dial-wrap">
+    <svg class="dial" viewBox="0 0 300 300" aria-hidden="true">
+      <circle class="dial__face" cx="150" cy="150" r="142"/>
+      <circle class="dial__bezel" cx="150" cy="150" r="142"/>
+      <g id="ticks"></g>
+      <path class="dial__track" d="M 59.49 240.51 A 128 128 0 1 1 240.51 240.51"/>
+      <path class="dial__value" id="dial-value" d="M 59.49 240.51 A 128 128 0 1 1 240.51 240.51"/>
+      <g id="needle" transform="rotate(135 150 150)">
+        <polygon class="dial__needle" points="268,146.5 292,146.5 292,153.5 268,153.5"/>
+      </g>
+    </svg>
+
+    <div class="readout">
+      <div class="readout__primary"><span id="kn">0.0</span><span class="readout__unit">kn</span></div>
+      <div class="readout__secondary"><span id="mph">0.0</span> mph</div>
+    </div>
+  </section>
+
+  <section class="mid">
+    <div class="compass">
+      <svg viewBox="0 0 120 120" aria-hidden="true">
+        <circle class="compass__face" cx="60" cy="60" r="52"/>
+        <g id="rose" transform="rotate(0 60 60)">
+          <g id="rose-ticks"></g>
+          <text class="compass__card compass__card--n" x="60" y="24">N</text>
+          <text class="compass__card" x="97" y="65">E</text>
+          <text class="compass__card" x="60" y="105">S</text>
+          <text class="compass__card" x="23" y="65">W</text>
+        </g>
+        <polygon class="compass__mark" points="60,4 54,16 66,16"/>
+      </svg>
+      <div class="compass__label">
+        <div class="compass__deg"><span id="cog">---</span>&deg;</div>
+        <div class="compass__src" id="cog-src">COG</div>
+      </div>
+    </div>
+
+    <div class="trip">
+      <div class="trip__cell"><div class="trip__val" id="dist">0.00</div><div class="trip__key">NM RUN</div></div>
+      <div class="trip__cell"><div class="trip__val" id="max">0.0</div><div class="trip__key">MAX KN</div></div>
+      <div class="trip__cell"><div class="trip__val" id="avg">0.0</div><div class="trip__key">AVG KN</div></div>
+      <div class="trip__cell"><div class="trip__val" id="elapsed">0:00</div><div class="trip__key">UNDERWAY</div></div>
+    </div>
+  </section>
+
+  <section class="panels">
+
+    <div class="panel" id="anchor-panel">
+      <div class="panel__head">
+        <span class="panel__title">Anchor watch</span>
+        <span class="panel__state" id="anchor-state">OFF</span>
+      </div>
+      <div class="panel__body">
+        <label class="field">
+          <span class="field__key">Swing radius</span>
+          <span class="field__ctl">
+            <input type="range" id="anchor-radius" min="10" max="120" step="5" value="30">
+            <output id="anchor-radius-out">30 m</output>
+          </span>
+        </label>
+        <div class="drift" id="drift-wrap" hidden>
+          <div class="drift__bar"><div class="drift__fill" id="drift-fill"></div></div>
+          <div class="drift__txt">Drift <span id="drift">0</span> m</div>
+        </div>
+        <button type="button" class="btn btn--primary" id="anchor-btn">DROP ANCHOR</button>
+      </div>
+    </div>
+
+    <div class="panel" id="nowake-panel">
+      <div class="panel__head">
+        <span class="panel__title">No-wake alarm</span>
+        <span class="panel__state" id="nowake-state">OFF</span>
+      </div>
+      <div class="panel__body">
+        <label class="field">
+          <span class="field__key">Alert above</span>
+          <span class="field__ctl">
+            <input type="range" id="nowake-limit" min="1" max="40" step="0.5" value="5">
+            <output id="nowake-limit-out">5.0 kn</output>
+          </span>
+        </label>
+        <button type="button" class="btn btn--primary" id="nowake-btn">ARM ALARM</button>
+      </div>
+    </div>
+
+  </section>
+
+  <footer class="tools">
+    <button type="button" class="btn btn--ghost" id="night-btn">NIGHT</button>
+    <button type="button" class="btn btn--ghost" id="compass-btn">COMPASS</button>
+    <button type="button" class="btn btn--ghost" id="reset-btn">RESET TRIP</button>
+  </footer>
+
+  <p class="caveat" id="caveat">
+    Anchor watch only runs while this app is open and the screen is awake. iOS suspends
+    web apps in the background &mdash; do not rely on it as a sleep-through alarm.
+  </p>
+
+</main>
+
+<div class="gate" id="gate">
+  <div class="gate__box">
+    <h1 class="gate__title">Boat&nbsp;Speedo</h1>
+    <p class="gate__copy">GPS speed, heading and trip log. Needs location access and works
+      best with the phone in a fixed spot at the helm.</p>
+    <button type="button" class="btn btn--primary btn--big" id="start-btn">START</button>
+    <p class="gate__err" id="gate-err" hidden></p>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
