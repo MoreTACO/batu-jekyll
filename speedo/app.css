@@ -41,6 +41,10 @@ body.night {
 
 * { box-sizing: border-box; }
 
+/* Inline SVG does not honour the hidden attribute on its own, and the tide card
+   hides its graph whenever there is nothing honest to draw. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -61,17 +65,81 @@ body {
            env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-.app {
+/* Two screens side by side, swiped between with native scroll snapping rather
+   than a hand-rolled gesture handler. The helm screen never scrolls; the passage
+   screen does. */
+.screens {
   flex: 1 1 auto;
   display: flex;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  scroll-behavior: smooth;
+  min-height: 0;
+  scrollbar-width: none;
+}
+.screens::-webkit-scrollbar { display: none; }
+
+.screen {
+  flex: 0 0 100%;
+  width: 100%;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  min-height: 0;
+}
+
+.app {
+  display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 10px 14px 14px;
+  gap: 9px;
+  padding: 10px 14px 6px;
   max-width: 560px;
   width: 100%;
   margin: 0 auto;
+  height: 100%;
   min-height: 0;
+  overflow: hidden;
 }
+
+.passage {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 14px 20px;
+  max-width: 560px;
+  margin: 0 auto;
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.passage__title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--trim);
+  margin: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+/* ---------- page dots ---------- */
+
+.dots {
+  flex: none;
+  display: flex;
+  justify-content: center;
+  gap: 7px;
+  padding: 7px 0 calc(env(safe-area-inset-bottom) + 7px);
+}
+.dots__dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--line);
+  transition: background .2s;
+}
+.dots__dot.is-on { background: var(--trim); }
 
 /* ---------- status strip ---------- */
 
@@ -102,17 +170,22 @@ body {
 
 /* ---------- dial ---------- */
 
+/* The dial absorbs whatever vertical space the fixed-height rows leave over, so
+   the helm screen fits without scrolling on any phone once the notch and home
+   indicator have taken their cut. */
 .dial-wrap {
   position: relative;
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   display: grid;
   place-items: center;
-  min-height: 0;
+  min-height: 120px;
 }
 
 .dial {
-  width: min(76vw, 300px, 42vh);
-  height: auto;
+  height: 100%;
+  width: auto;
+  max-width: min(84vw, 330px);
+  max-height: 100%;
   display: block;
 }
 
@@ -144,8 +217,10 @@ body.over-limit .dial__needle { fill: var(--warn); }
   pointer-events: none;
 }
 
+/* Sized from the dial's actual rendered width (set by a ResizeObserver in app.js)
+   so the readout always fits the clear interior, whatever size the dial ends up. */
 .readout__primary {
-  font-size: clamp(38px, 12.5vw, 60px);
+  font-size: calc(var(--dial, 300px) * 0.2);
   line-height: 1;
   font-weight: 700;
   color: var(--text);
@@ -163,10 +238,34 @@ body.over-limit .dial__needle { fill: var(--warn); }
 }
 
 .readout__secondary {
-  margin-top: 4px;
-  font-size: clamp(13px, 4vw, 17px);
+  margin-top: calc(var(--dial, 300px) * 0.013);
+  font-size: calc(var(--dial, 300px) * 0.056);
   color: var(--text-dim);
   letter-spacing: .07em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- speed sparkline ---------- */
+
+.spark { flex: none; }
+
+.spark__svg {
+  display: block;
+  width: 100%;
+  height: 34px;
+  overflow: visible;
+}
+.spark__line { fill: none; stroke: var(--accent); stroke-width: 1.6;
+               vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.spark__area { fill: var(--accent); opacity: .13; }
+
+.spark__key {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  letter-spacing: .09em;
+  color: var(--text-dim);
+  margin-top: 2px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -316,6 +415,8 @@ body.night .btn--primary { background: transparent; color: var(--text); border-c
 .btn--ghost { flex: 1; border-color: var(--line); color: var(--text-dim); font-size: 11px; padding: 11px 6px; }
 .btn--ghost.is-on { border-color: var(--trim); color: var(--trim); }
 
+.btn--slim { flex: none; padding: 10px 14px; font-size: 11px; }
+
 .btn--big { font-size: 16px; padding: 16px 44px; }
 
 .tools { display: flex; gap: 8px; }
@@ -328,6 +429,193 @@ body.night .btn--primary { background: transparent; color: var(--text); border-c
   border-top: 1px solid var(--line);
   padding-top: 8px;
 }
+
+/* ---------- passage cards ---------- */
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 11px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.card__head { display: flex; justify-content: space-between; align-items: baseline; }
+.card__title { font-size: 13px; font-weight: 600; }
+.card__state { font-size: 10px; letter-spacing: .12em; color: var(--text-dim); }
+.card__state.is-warn { color: var(--warn); }
+.card__state.is-ok { color: var(--ok); }
+
+.card__note {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.card__note.is-warn { color: var(--warn); }
+.card__note:empty { display: none; }
+
+.link-btn {
+  font: inherit;
+  font-size: 11px;
+  background: none;
+  border: none;
+  padding: 0 0 0 8px;
+  color: var(--trim);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.text-input {
+  font: inherit;
+  font-size: 14px;
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 10px;
+  color: var(--text);
+}
+
+/* ---------- tide ---------- */
+
+.tide__station {
+  display: flex;
+  align-items: baseline;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.tide__station > span { flex: 1; min-width: 0; }
+
+.tide__now { display: flex; align-items: center; gap: 14px; }
+
+.tide__height {
+  font-size: 38px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.tide__unit { font-size: .34em; color: var(--trim); margin-left: .2em; letter-spacing: .08em; }
+
+.tide__meta { font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+.tide__next { font-variant-numeric: tabular-nums; }
+
+.tide__graph {
+  display: block;
+  width: 100%;
+  height: 108px;
+  overflow: visible;
+}
+.tide__line { fill: none; stroke: var(--accent); stroke-width: 1.8;
+              vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.tide__area { fill: var(--accent); opacity: .14; }
+.tide__nowline { stroke: var(--trim); stroke-width: 1; stroke-dasharray: 3 3;
+                 vector-effect: non-scaling-stroke; }
+.tide__mark { fill: var(--trim); }
+
+.tide__axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  letter-spacing: .08em;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.tide__list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 5px; }
+.tide__list li {
+  flex: 1 1 46%;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 7px;
+}
+.tide__list .is-high { color: var(--trim); }
+.tide__list .is-low { color: var(--text-dim); }
+
+.tide__picker { display: flex; flex-direction: column; gap: 8px;
+                border-top: 1px solid var(--line); padding-top: 9px; }
+.tide__picker[hidden] { display: none; }
+.tide__picker-head { font-size: 10px; letter-spacing: .11em; color: var(--text-dim); }
+
+.tide__stations { list-style: none; margin: 0; padding: 0;
+                  display: flex; flex-direction: column; gap: 4px;
+                  max-height: 190px; overflow-y: auto; }
+.tide__stations button {
+  font: inherit;
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 9px;
+  color: var(--text);
+  min-height: 40px;
+  cursor: pointer;
+}
+.tide__stations button.is-on { border-color: var(--trim); color: var(--trim); }
+.tide__stations .dist { color: var(--text-dim); font-variant-numeric: tabular-nums; flex: none; }
+
+/* ---------- sun ---------- */
+
+.sun { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.sun__cell { background: var(--bg); border: 1px solid var(--line);
+             border-radius: 8px; padding: 7px 8px; }
+.sun__val { font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums;
+            color: var(--text); line-height: 1.1; }
+.sun__key { font-size: 8px; letter-spacing: .1em; color: var(--text-dim); margin-top: 2px; }
+
+.toggle { display: flex; align-items: center; gap: 9px; font-size: 11px;
+          color: var(--text-dim); cursor: pointer; min-height: 32px; }
+.toggle input { width: 18px; height: 18px; accent-color: var(--trim); flex: none; }
+
+/* ---------- trip log ---------- */
+
+.log { list-style: none; margin: 0; padding: 0; display: flex;
+       flex-direction: column; gap: 5px; }
+.log:empty { display: none; }
+
+.log__row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px 9px;
+}
+.log__when { font-size: 11px; color: var(--text-dim); width: 66px; flex: none; }
+.log__stats { flex: 1; min-width: 0; font-size: 11px; font-variant-numeric: tabular-nums; }
+.log__stats b { font-weight: 700; color: var(--text); }
+.log__del {
+  font: inherit; font-size: 15px; line-height: 1;
+  background: none; border: none; color: var(--text-dim);
+  padding: 6px 4px; cursor: pointer; flex: none;
+}
+
+.log__totals {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.log__totals[hidden] { display: none; }
+
+.log__tools { display: flex; gap: 8px; }
 
 /* ---------- alarm ---------- */
 
@@ -380,9 +668,18 @@ body.alarming .app { animation: alarm-flash 1s steps(1) infinite; }
 .gate__err { margin: 18px 0 0; font-size: 13px; line-height: 1.5; color: var(--warn); }
 .gate__err[hidden] { display: none; }
 
-/* Landscape / short screens: drop the dial down so everything still fits. */
-@media (max-height: 620px) {
-  .dial { width: min(52vw, 220px); }
-  .readout__primary { font-size: clamp(34px, 9vw, 48px); }
-  .caveat { display: none; }
+/* Short screens (iPhone SE and friends). The dial shrinks on its own, but the
+   fixed-height rows below it still add up to more than the screen, so trim them
+   and drop the sparkline — it is the one thing here that is nice rather than
+   necessary. Verified against a no-overflow assertion in speedo/test/verify.js. */
+@media (max-height: 700px) {
+  .spark { display: none; }
+  .compass { width: 88px; }
+  .trip__cell { padding: 5px 8px; }
+  .trip__val { font-size: 17px; }
+  .panel { padding: 8px 10px; }
+  .panel__head { margin-bottom: 6px; }
+  .panel__body { gap: 7px; }
+  .btn { min-height: 40px; padding: 9px 12px; }
+  .app { gap: 7px; }
 }

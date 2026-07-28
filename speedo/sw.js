@@ -1,16 +1,26 @@
 /* Cache-first service worker: once installed the app runs with no signal at all,
    which is the normal condition a mile offshore. */
-var CACHE = 'boat-speedo-v1';
+var CACHE = 'boat-speedo-v2';
 
 var ASSETS = [
   './',
   './index.html',
   './app.css',
   './app.js',
+  './sun.js',
+  './trips.js',
+  './tides.js',
   './manifest.webmanifest',
   './icons/icon-180.png',
   './icons/icon-512.png'
 ];
+
+/* Tide predictions come from a third-party API and must never be served from the
+   app shell cache — they are cached deliberately in localStorage instead, with a
+   timestamp, so the UI can say how old they are. */
+function isTideRequest(url) {
+  return /tidesandcurrents|datagetter/.test(url);
+}
 
 self.addEventListener('install', function (e) {
   e.waitUntil(
@@ -34,6 +44,7 @@ self.addEventListener('activate', function (e) {
 
 self.addEventListener('fetch', function (e) {
   if (e.request.method !== 'GET') return;
+  if (isTideRequest(e.request.url)) return;    // straight to the network, never cached here
 
   e.respondWith(
     caches.match(e.request).then(function (hit) {

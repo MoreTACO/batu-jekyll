@@ -17,22 +17,14 @@ struct ContentView: View {
         ZStack(alignment: .top) {
             p.bg.ignoresSafeArea()
 
-            VStack(spacing: 10) {
-                statusStrip
-                SpeedDial(knots: model.knots,
-                          mph: model.mph,
-                          maxKnots: dialMax,
-                          overLimit: model.speedAlarm.isOverLimit,
-                          palette: p)
-                    .layoutPriority(1)
-                midRow
-                anchorPanel
-                noWakePanel
-                toolsRow
-                caveat
+            // Helm on the first page, passage detail on the second. The helm screen
+            // stays glanceable at planing speed with nothing extra added to it.
+            TabView {
+                helmScreen
+                PassageView(model: model)
             }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 14)
+            .tabViewStyle(.page(indexDisplayMode: .always))
+            .indexViewStyle(.page(backgroundDisplayMode: .interactive))
 
             if model.anchorWatch.isDragging || model.speedAlarm.isOverLimit {
                 alarmBanner
@@ -41,6 +33,26 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .statusBarHidden(false)
         .onAppear { model.start() }
+    }
+
+    private var helmScreen: some View {
+        VStack(spacing: 9) {
+            statusStrip
+            SpeedDial(knots: model.knots,
+                      mph: model.mph,
+                      maxKnots: dialMax,
+                      overLimit: model.speedAlarm.isOverLimit,
+                      palette: p)
+                .layoutPriority(1)
+            SpeedSparkline(samples: model.spark, palette: p)
+                .frame(height: 46)
+            midRow
+            anchorPanel
+            noWakePanel
+            toolsRow
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 14)
     }
 
     // MARK: - status
@@ -230,7 +242,7 @@ struct ContentView: View {
     private var toolsRow: some View {
         HStack(spacing: 8) {
             ghost(model.night ? "DAY" : "NIGHT") { model.night.toggle() }
-            ghost("RESET TRIP") { model.resetTrip() }
+            ghost("END TRIP") { model.endTrip() }
         }
     }
 
@@ -266,14 +278,66 @@ struct ContentView: View {
         .background(p.warn)
     }
 
-    private var caveat: some View {
-        Text("Anchor watch keeps running in the background once you allow Always "
-             + "location access. Keep the phone charged — GPS at navigation accuracy "
-             + "is hard on the battery.")
-            .font(.system(size: 10))
-            .foregroundStyle(p.textDim)
-            .padding(.top, 8)
-            .overlay(Rectangle().frame(height: 1).foregroundStyle(p.line), alignment: .top)
+}
+
+/// Ten minutes of speed history under the dial. Scaled to the samples it has, so
+/// it spans the box from the first moments rather than being squashed against the
+/// right-hand edge until the window fills.
+struct SpeedSparkline: View {
+    let samples: [(t: Date, ms: Double)]
+    let palette: Palette
+
+    /// Never scale below this, or a slow drift renders as dramatic mountains.
+    private let floorKnots = 5.0
+
+    var body: some View {
+        VStack(spacing: 2) {
+            GeometryReader { geo in
+                let w = geo.size.width, h = geo.size.height
+
+                if samples.count >= 2,
+                   let tFrom = samples.first?.t, let tLast = samples.last?.t {
+                    let span = max(tLast.timeIntervalSince(tFrom), 1)
+                    let peak = max(floorKnots, (samples.map(\.ms).max() ?? 0) * Units.knotsPerMS)
+
+                    let line = Path { path in
+                        for (i, s) in samples.enumerated() {
+                            let x = CGFloat(s.t.timeIntervalSince(tFrom) / span) * w
+                            let y = h - CGFloat(s.ms * Units.knotsPerMS / peak) * (h - 2)
+                            i == 0 ? path.move(to: CGPoint(x: x, y: y))
+                                   : path.addLine(to: CGPoint(x: x, y: y))
+                        }
+                    }
+
+                    ZStack {
+                        var area = line
+                        let _ = {
+                            area.addLine(to: CGPoint(x: w, y: h))
+                            area.addLine(to: CGPoint(x: 0, y: h))
+                            area.closeSubpath()
+                        }()
+                        area.fill(palette.accent.opacity(0.13))
+                        line.strokedPath(.init(lineWidth: 1.6, lineJoin: .round))
+                            .foregroundStyle(palette.accent)
+                    }
+                }
+            }
+
+            HStack {
+                Text(spanLabel)
+                Spacer()
+                Text(String(format: "%.1f kn peak",
+                            (samples.map(\.ms).max() ?? 0) * Units.knotsPerMS))
+            }
+            .font(.system(size: 9)).kerning(0.9).monospacedDigit()
+            .foregroundStyle(palette.textDim)
+        }
+    }
+
+    private var spanLabel: String {
+        guard let first = samples.first?.t, let last = samples.last?.t else { return "last 10 min" }
+        let s = last.timeIntervalSince(first)
+        return s >= 60 ? "last \(Int((s / 60).rounded())) min" : "last \(Int(s.rounded())) s"
     }
 }
 

@@ -13,14 +13,18 @@ web app in [`../speedo/`](../speedo/), plus the one thing a web app cannot do:
 | File | What it does |
 |---|---|
 | `BoatSpeedoApp.swift` | App entry, notification permission and presentation |
-| `SpeedoModel.swift` | Ties fixes to the trip log and both alarms; smoothing and fallback rules |
+| `SpeedoModel.swift` | Ties fixes to the trip log, both alarms, sparkline and auto night mode |
 | `LocationManager.swift` | CoreLocation wrapper, background updates, magnetometer heading |
 | `TripStats.swift` | Distance / max / average with accuracy and jitter filtering, plus unit helpers |
 | `AnchorWatch.swift` | Swing circle, drag detection, alarm sound and local notification |
 | `SpeedAlarm.swift` | No-wake threshold monitor |
-| `SpeedDial.swift` | The gauge |
+| `SunTimes.swift` | Sunrise, sunset, civil twilight — computed locally, no network |
+| `TripLog.swift` | Saved trips in UserDefaults, totals and CSV export |
+| `TideStore.swift` | NOAA CO-OPS predictions, nearest-station choice, caching |
+| `SpeedDial.swift` | The gauge, plus `SpeedSparkline` in `ContentView.swift` |
 | `CompassRose.swift` | Rotating compass card |
-| `ContentView.swift` | Screen layout |
+| `ContentView.swift` | Helm screen; swipes to `PassageView` |
+| `PassageView.swift` | Tides, sun times and the trip log |
 | `Theme.swift` | Nautical palette, day and night |
 
 ## Building it
@@ -63,12 +67,20 @@ rely on the app at anchor.
 - **`content.sound = .defaultCritical`** only actually bypasses silent mode if Apple
   grants your app the Critical Alerts entitlement, which requires a separate request
   to them. Without it the notification still fires, just politely.
-- **No trip persistence.** `TripStats` is `Codable` and ready for it, but nothing
-  writes it to disk yet, so a force-quit loses the current run. The web version
-  persists to `localStorage`.
+- **The current run is not persisted.** Finished trips are saved to UserDefaults by
+  `TripLog`, but a force-quit mid-passage loses the run in progress. The web version
+  persists it to `localStorage` on every fix.
 - **Battery.** `kCLLocationAccuracyBestForNavigation` plus background updates is
   the heaviest GPS mode iOS has. Keep the phone on a charger for anything longer
   than a few hours.
+- **Tides need a signal.** They cannot be computed offline — prediction needs
+  harmonic constants measured per station — so `TideStore` fetches and caches four
+  days at a time. Coverage is **US waters only** (NOAA CO-OPS). For elsewhere, swap
+  the URL building in `TideStore.fetchPredictions` for a worldwide provider; the
+  cache, graph and UI need no changes.
+- **Tides work here even if they fail on the web.** The web version's biggest risk is
+  the browser blocking the cross-origin request; `URLSession` has no such restriction,
+  so this is the version guaranteed to reach the API.
 
 ## Cross-checking against the web version
 

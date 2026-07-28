@@ -39,6 +39,40 @@ const IPHONE = {
   hasTouch: true
 };
 
+// Synthetic semidiurnal tide, used both to stub the network and to seed the cache
+// for screenshots. A real curve is not a pure sinusoid, but it is close enough to
+// exercise every code path and to show what the graph looks like with data in it.
+const TIDE = { periodH: 12.42, meanFt: 3.0, ampFt: 2.5, firstHighOffsetH: 1.7 };
+
+function tideHeightAt(t, firstHigh) {
+  return TIDE.meanFt + TIDE.ampFt *
+    Math.cos(2 * Math.PI * (t - firstHigh) / (TIDE.periodH * 3600000));
+}
+
+/** The bundle shape BoatTides caches, for seeding localStorage directly. */
+function makeTideBundle(now) {
+  const HOUR = 3600000;
+  const firstHigh = now + TIDE.firstHighOffsetH * HOUR;
+  const curve = [];
+  for (let t = now - 24 * HOUR; t <= now + 48 * HOUR; t += HOUR) {
+    curve.push({ t, v: tideHeightAt(t, firstHigh), type: null });
+  }
+  const hilo = [];
+  for (let n = -3; n <= 6; n++) {
+    hilo.push({ t: firstHigh + n * TIDE.periodH * HOUR, v: TIDE.meanFt + TIDE.ampFt, type: 'H' });
+    hilo.push({ t: firstHigh + (n + 0.5) * TIDE.periodH * HOUR, v: TIDE.meanFt - TIDE.ampFt, type: 'L' });
+  }
+  hilo.sort((a, b) => a.t - b.t);
+  return {
+    stationId: '8518750',
+    stationName: 'The Battery, NY',
+    distanceM: 2856,
+    fetchedAt: now - 1800000,
+    hilo,
+    curve: curve.concat(hilo).sort((a, b) => a.t - b.t)
+  };
+}
+
 (async () => {
   const browser = await chromium.launch();
 
@@ -278,29 +312,76 @@ const IPHONE = {
   }
 
   // ------------------------------------------------------------- screenshots
-  console.log('\n--- C. appearance ---');
+  console.log('\n--- C. appearance and fit ---');
   {
+    // The helm screen is overflow:hidden, so anything that does not fit would be
+    // silently clipped rather than scrolling. Check the tightest phone we support
+    // as well as a current one.
+    const DEVICES = [
+      { name: 'iphone-16', viewport: { width: 393, height: 852 } },
+      { name: 'iphone-se', viewport: { width: 375, height: 667 } }
+    ];
+
     for (const mode of ['day', 'night']) {
-      const ctx = await browser.newContext({
-        ...IPHONE,
-        permissions: ['geolocation'],
-        geolocation: { latitude: 40.6892, longitude: -74.0445, accuracy: 5 }
-      });
-      const page = await ctx.newPage();
-      await page.addInitScript((night) => {
-        localStorage.setItem('boat-speedo/v1', JSON.stringify({
-          trip: { distM: 8043, maxMs: 9.9, movingMs: 2760000 },
-          anchor: null, anchorRadius: 30, noWakeKn: 5,
-          noWakeArmed: false, night: night
-        }));
-      }, mode === 'night');
-      await page.goto(`${BASE}/index.html?demo=1`);
-      await page.click('#start-btn');
-      await page.waitForTimeout(9000);           // let the demo track build speed
-      const path = `${SHOT}/shot-${mode}.png`;
-      await page.screenshot({ path });
-      console.log('   wrote', path);
-      await ctx.close();
+      for (const device of DEVICES) {
+        const ctx = await browser.newContext({
+          ...IPHONE,
+          viewport: device.viewport,
+          permissions: ['geolocation'],
+          geolocation: { latitude: 40.6892, longitude: -74.0445, accuracy: 5 }
+        });
+        const page = await ctx.newPage();
+        await page.addInitScript((seed) => {
+          localStorage.setItem('boat-speedo/v1', JSON.stringify({
+            trip: { distM: 8043, maxMs: 9.9, movingMs: 2760000, startedAt: Date.now() - 2760000 },
+            anchor: null, anchorRadius: 30, noWakeKn: 5,
+            // autoNight off here: with it on, the app would correctly override the
+            // seeded palette to match the actual time of day, which is the wrong
+            // thing for a screenshot of night mode.
+            noWakeArmed: false, night: seed.night, autoNight: false
+          }));
+          localStorage.setItem('boat-speedo/trips/v1', JSON.stringify([
+            { id: 'a', startedAt: Date.now() - 86400000, endedAt: Date.now() - 79200000,
+              distM: 22040, maxMs: 10.8, movingMs: 6300000 },
+            { id: 'b', startedAt: Date.now() - 604800000, endedAt: Date.now() - 597600000,
+              distM: 9210, maxMs: 8.2, movingMs: 3900000 }
+          ]));
+          localStorage.setItem('boat-speedo/tides/v1', JSON.stringify(seed.tide));
+        }, { night: mode === 'night', tide: makeTideBundle(Date.now()) });
+        await page.goto(`${BASE}/index.html?demo=1`);
+        await page.click('#start-btn');
+        await page.waitForTimeout(mode === 'day' && device.name === 'iphone-16' ? 9000 : 2500);
+
+        const fit = await page.evaluate(() => {
+          const helm = document.getElementById('screen-helm');
+          return {
+            overflow: helm.scrollHeight - helm.clientHeight,
+            dialVar: getComputedStyle(document.documentElement).getPropertyValue('--dial').trim(),
+            readoutPx: getComputedStyle(document.querySelector('.readout__primary')).fontSize
+          };
+        });
+        if (fit.overflow > 1) {
+          failures++;
+          console.log(`FAIL  C: helm screen overflows by ${fit.overflow}px on ${device.name}`);
+        } else {
+          console.log(`PASS  C: helm screen fits ${device.name} (dial ${fit.dialVar}, readout ${fit.readoutPx})`);
+        }
+
+        if (device.name === 'iphone-16') {
+          await page.screenshot({ path: `${SHOT}/shot-${mode}.png` });
+          // Swipe to the passage screen and capture that too.
+          await page.evaluate(() => {
+            const s = document.getElementById('screens');
+            s.scrollLeft = s.clientWidth;
+            s.dispatchEvent(new Event('scroll'));
+          });
+          await page.waitForTimeout(600);
+          await page.screenshot({ path: `${SHOT}/shot-passage-${mode}.png` });
+          console.log(`   wrote ${SHOT}/shot-${mode}.png and shot-passage-${mode}.png`);
+        }
+
+        await ctx.close();
+      }
     }
   }
 
@@ -340,6 +421,542 @@ const IPHONE = {
     checkEq('D: start screen shown', offline.gate, true);
 
     await ctx.setOffline(false);
+    await ctx.close();
+  }
+
+  // ------------------------------------------------------------ E. sun times
+  //
+  // Cross-checked against independent spherical geometry, NOT against the app's
+  // own numbers. Day length is derived here from the standard hour-angle relation
+  // using textbook solstice declination, so an error in the app's solar series —
+  // the part most likely to be wrong — cannot hide behind a self-consistent test.
+  console.log('\n--- E. sun times ---');
+  {
+    const ctx = await browser.newContext(IPHONE);
+    const page = await ctx.newPage();
+    page.on('pageerror', e => { failures++; console.log('FAIL  page error:', e.message); });
+    await page.goto(`${BASE}/index.html`);
+
+    // Hours of daylight for a latitude and solar declination, upper limb at the
+    // horizon including refraction (-0.833°).
+    const expectedDayLenH = (latDeg, decDeg) => {
+      const r = Math.PI / 180;
+      const cosH = (Math.sin(-0.833 * r) - Math.sin(latDeg * r) * Math.sin(decDeg * r))
+                 / (Math.cos(latDeg * r) * Math.cos(decDeg * r));
+      return 2 * Math.acos(Math.max(-1, Math.min(1, cosH))) / r / 15;
+    };
+
+    const sun = await page.evaluate(() => {
+      const at = (lat, lon, iso) => {
+        const t = window.BoatSun.times(lat, lon, new Date(iso));
+        return {
+          dayLengthMin: t.dayLengthMin,
+          sunrise: t.sunrise ? t.sunrise.getTime() : null,
+          sunset: t.sunset ? t.sunset.getTime() : null,
+          noon: t.solarNoon.getTime(),
+          polar: t.polar
+        };
+      };
+      return {
+        equatorEquinox: at(0, 0, '2026-03-20T12:00:00Z'),
+        nycEquinox:     at(40.7, -74.0, '2026-03-20T17:00:00Z'),
+        nycJune:        at(40.7, -74.0, '2026-06-21T16:00:00Z'),
+        nycDec:         at(40.7, -74.0, '2026-12-21T17:00:00Z'),
+        noonAt0:        at(51.5, 0, '2026-05-15T12:00:00Z'),
+        noonAtMinus75:  at(51.5, -75, '2026-05-15T17:00:00Z'),
+        arcticJune:     at(80, 20, '2026-06-21T12:00:00Z'),
+        arcticDec:      at(80, 20, '2026-12-21T12:00:00Z')
+      };
+    });
+
+    check('E: equator, equinox day length (h)',
+      sun.equatorEquinox.dayLengthMin / 60, expectedDayLenH(0, 0), 0.17);
+    check('E: 40.7°N, equinox day length (h)',
+      sun.nycEquinox.dayLengthMin / 60, expectedDayLenH(40.7, 0), 0.17);
+    check('E: 40.7°N, June solstice day length (h)',
+      sun.nycJune.dayLengthMin / 60, expectedDayLenH(40.7, 23.44), 0.14);
+    check('E: 40.7°N, Dec solstice day length (h)',
+      sun.nycDec.dayLengthMin / 60, expectedDayLenH(40.7, -23.44), 0.14);
+
+    // Sunrise and sunset must sit symmetrically either side of solar noon.
+    const beforeNoon = (sun.nycJune.noon - sun.nycJune.sunrise) / 60000;
+    const afterNoon = (sun.nycJune.sunset - sun.nycJune.noon) / 60000;
+    check('E: sunrise/sunset symmetric about solar noon (min)', beforeNoon, afterNoon, 1);
+
+    // Solar noon at the prime meridian is 12:00 UTC give or take the equation of
+    // time, which never exceeds ~16 minutes.
+    const noonUTCmin = (sun.noonAt0.noon % 86400000) / 60000;
+    check('E: solar noon at lon 0 is near 12:00 UTC (min past midnight)',
+      noonUTCmin, 720, 17);
+
+    // Longitude must shift solar noon by exactly 4 minutes per degree.
+    const shiftH = (sun.noonAtMinus75.noon - sun.noonAt0.noon) / 3600000;
+    check('E: solar noon shifts by lon/15 hours', shiftH, 5, 0.05);
+
+    checkEq('E: Arctic midnight sun has no sunrise', sun.arcticJune.sunrise, null);
+    checkEq('E: Arctic midnight sun flagged as polar day', sun.arcticJune.polar, 'day');
+    checkEq('E: Arctic polar night flagged', sun.arcticDec.polar, 'night');
+
+    const dark = await page.evaluate(() => ({
+      // 03:00 and 13:00 local, mid-summer in NYC.
+      night: window.BoatSun.isDark(40.7, -74, new Date(2026, 5, 21, 3, 0)),
+      day: window.BoatSun.isDark(40.7, -74, new Date(2026, 5, 21, 13, 0))
+    }));
+    checkEq('E: isDark true before dawn', dark.night, true);
+    checkEq('E: isDark false at midday', dark.day, false);
+
+    // Auto night mode: whatever the real time is when this runs, two positions
+    // half a world apart cannot both be in daylight, so this checks the palette
+    // actually follows the sun rather than a hard-coded guess.
+    await page.click('#start-btn');
+    const auto = await page.evaluate(() => {
+      const s = window.__speedo, api = window.__speedoApi;
+      const probe = (lat, lon) => {
+        s.prev = { lat, lon, t: Date.now() };
+        s.autoNight = true;
+        s.lastAutoDark = null;
+        api.applyAutoNight();
+        return { dark: window.BoatSun.isDark(lat, lon, new Date()), night: s.night };
+      };
+      const west = probe(40.7, -74);      // New York
+      const east = probe(40.7, 106);      // roughly antipodal in longitude
+
+      // A manual tap must survive until the next sunrise or sunset.
+      s.prev = { lat: 40.7, lon: -74, t: Date.now() };
+      s.autoNight = true; s.lastAutoDark = null;
+      api.applyAutoNight();
+      const afterAuto = s.night;
+      s.night = !afterAuto;               // simulate the user tapping NIGHT
+      api.applyAutoNight();               // must not immediately undo it
+      return { west, east, manualHeld: s.night === !afterAuto };
+    });
+    console.log('   auto-night:', JSON.stringify(auto));
+
+    checkEq('E: exactly one of the two positions is in darkness',
+      auto.west.dark !== auto.east.dark, true);
+    checkEq('E: palette follows the sun (west)', auto.west.night, auto.west.dark);
+    checkEq('E: palette follows the sun (east)', auto.east.night, auto.east.dark);
+    checkEq('E: a manual night toggle is not immediately overridden',
+      auto.manualHeld, true);
+
+    await ctx.close();
+  }
+
+  // ------------------------------------------------------------ F. sparkline
+  console.log('\n--- F. speed sparkline ---');
+  {
+    const ctx = await browser.newContext(IPHONE);
+    const page = await ctx.newPage();
+    page.on('pageerror', e => { failures++; console.log('FAIL  page error:', e.message); });
+    await page.goto(`${BASE}/index.html`);
+
+    const spark = await page.evaluate(() => {
+      const api = window.__speedoApi;
+      const s = window.__speedo;
+      s.spark.length = 0;
+      api.resetSparkClock();
+
+      // 12 minutes of samples every 2 s, peaking at 10 m/s halfway through. The
+      // window is 10 minutes, so the first 2 minutes must fall off the back.
+      const base = Date.now();
+      const total = 360;
+      for (let i = 0; i < total; i++) {
+        const t = base + i * 2000;
+        const ms = i === 180 ? 10 : 2;
+        api.pushSpark(t, ms);
+      }
+      const last = base + (total - 1) * 2000;
+      api.renderSpark(last);
+
+      const d = document.getElementById('spark-line').getAttribute('d');
+      const pts = d.trim().split(/(?=[ML] )/).filter(Boolean).map(seg => {
+        const [, x, y] = seg.trim().split(/\s+/);
+        return { x: Number(x), y: Number(y) };
+      });
+      return {
+        buffered: s.spark.length,
+        oldest: s.spark[0].t - base,
+        pointCount: pts.length,
+        minY: Math.min(...pts.map(p => p.y)),
+        maxY: Math.max(...pts.map(p => p.y)),
+        peakLabel: document.getElementById('spark-peak').textContent,
+        spanLabel: document.getElementById('spark-span').textContent,
+        firstX: pts[0].x,
+        lastX: pts[pts.length - 1].x,
+        area: document.getElementById('spark-area').getAttribute('d')
+      };
+    });
+    console.log('   spark:', JSON.stringify({ ...spark, area: spark.area.slice(0, 20) + '…' }));
+
+    // 10-minute window at one sample per 2 s = 300 samples, plus the boundary one.
+    check('F: buffer holds one window', spark.buffered, 301, 1);
+    check('F: samples older than the window are dropped (ms)', spark.oldest, 120000, 2000);
+    checkEq('F: path has one point per sample', spark.pointCount, spark.buffered);
+    // Peak sample maps to the top of the 40-unit box (H - (H-2) = 2).
+    check('F: peak sample drawn at the top of the box', spark.minY, 2, 0.2);
+    // 2 m/s against a 10 m/s peak = 20% of the way up from the baseline.
+    check('F: quiet samples drawn proportionally', spark.maxY, 40 - 0.2 * 38, 0.3);
+    checkEq('F: peak label in knots', spark.peakLabel, (10 * KN).toFixed(1));
+    checkEq('F: area path is closed', spark.area.trim().endsWith('Z'), true);
+    check('F: trace starts at the left edge', spark.firstX, 0, 0.01);
+    check('F: trace ends at the right edge', spark.lastX, 300, 0.01);
+    checkEq('F: span label matches the data held', spark.spanLabel, 'last 10 min');
+
+    // Before the window fills, the trace must still span the box rather than
+    // being squashed against the right-hand edge.
+    const young = await page.evaluate(() => {
+      const api = window.__speedoApi, s = window.__speedo;
+      s.spark.length = 0;
+      api.resetSparkClock();
+      const base = Date.now();
+      for (let i = 0; i < 5; i++) api.pushSpark(base + i * 2000, 1 + i);
+      api.renderSpark(base + 8000);
+      const d = document.getElementById('spark-line').getAttribute('d');
+      const xs = d.trim().split(/(?=[ML] )/).filter(Boolean)
+        .map(seg => Number(seg.trim().split(/\s+/)[1]));
+      return { first: xs[0], last: xs[xs.length - 1], count: xs.length,
+               label: document.getElementById('spark-span').textContent };
+    });
+    checkEq('F: young trace still has every sample', young.count, 5);
+    check('F: young trace starts at the left edge', young.first, 0, 0.01);
+    check('F: young trace ends at the right edge', young.last, 300, 0.01);
+    checkEq('F: young trace labels its real span', young.label, 'last 8 s');
+
+    await ctx.close();
+  }
+
+  // ------------------------------------------------------------ G. trip log
+  console.log('\n--- G. saved trip log ---');
+  {
+    const ctx = await browser.newContext(IPHONE);
+    const page = await ctx.newPage();
+    page.on('pageerror', e => { failures++; console.log('FAIL  page error:', e.message); });
+    await page.addInitScript(() => {
+      window.__cb = null;
+      navigator.geolocation.watchPosition = function (cb) { window.__cb = cb; return 1; };
+      window.__feed = function (lat, lon, t, acc) {
+        window.__cb({
+          coords: { latitude: lat, longitude: lon, accuracy: acc, speed: null, heading: null },
+          timestamp: t
+        });
+      };
+    });
+    await page.goto(`${BASE}/index.html`);
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    await page.click('#start-btn');
+
+    // Same 870 m / 120 s track as pass B, then file it.
+    const logged = await page.evaluate((Rv) => {
+      const nd = (m) => (m / Rv) * (180 / Math.PI);
+      let lat = 40.0, t = 1700000000000;
+      window.__feed(lat, -74, t, 6);
+      for (let i = 0; i < 60; i++) { lat += nd(5.0); t += 1000; window.__feed(lat, -74, t, 6); }
+      for (let i = 0; i < 60; i++) { lat += nd(9.5); t += 1000; window.__feed(lat, -74, t, 6); }
+      const startedAt = window.__speedo.trip.startedAt;
+      const entry = window.__speedoApi.endTrip(false);
+      return {
+        entry, startedAt,
+        stored: window.BoatTrips.list(),
+        tripAfter: window.__speedo.trip,
+        csv: window.BoatTrips.toCSV()
+      };
+    }, R);
+    console.log('   logged:', JSON.stringify(logged.stored));
+
+    check('G: stored distance (m)', logged.stored[0].distM, 870, 0.5);
+    check('G: stored time under way (ms)', logged.stored[0].movingMs, 120000, 1);
+    check('G: stored max speed (m/s)', logged.stored[0].maxMs, 9.5, 0.05);
+    checkEq('G: one trip in the log', logged.stored.length, 1);
+    checkEq('G: trip start recorded', typeof logged.startedAt, 'number');
+    check('G: counters zeroed after filing', logged.tripAfter.distM, 0, 0.001);
+    checkEq('G: start time cleared after filing', logged.tripAfter.startedAt, null);
+
+    const csvLines = logged.csv.trim().split('\n');
+    checkEq('G: CSV header', csvLines[0],
+      'started,ended,distance_nm,duration_min,max_kn,avg_kn');
+    checkEq('G: CSV row count', csvLines.length, 2);
+    checkEq('G: CSV distance column', csvLines[1].split(',')[2], '0.47');
+    checkEq('G: CSV max column', csvLines[1].split(',')[4], (9.5 * KN).toFixed(1));
+
+    // A few metres on the dock is not a passage.
+    const tooShort = await page.evaluate(() => {
+      const before = window.BoatTrips.list().length;
+      const r = window.BoatTrips.add({ distM: 40, maxMs: 1, movingMs: 30000, startedAt: Date.now() });
+      return { r, after: window.BoatTrips.list().length, before };
+    });
+    checkEq('G: sub-100 m run is not logged', tooShort.r, null);
+    checkEq('G: log unchanged by a too-short run', tooShort.after, tooShort.before);
+
+    // Auto-save only after twenty minutes stopped.
+    const auto = await page.evaluate(() => {
+      const s = window.__speedo;
+      s.trip = { distM: 2000, maxMs: 5, movingMs: 600000, startedAt: Date.now() - 900000 };
+      s.stoppedSince = Date.now() - 19 * 60000;
+      window.__speedoApi.maybeAutoSave(Date.now());
+      const at19 = window.BoatTrips.list().length;
+
+      s.stoppedSince = Date.now() - 21 * 60000;
+      window.__speedoApi.maybeAutoSave(Date.now());
+      return { at19, at21: window.BoatTrips.list().length, distAfter: s.trip.distM };
+    });
+    checkEq('G: no auto-save at 19 minutes stopped', auto.at19, 1);
+    checkEq('G: auto-save fires at 21 minutes stopped', auto.at21, 2);
+    check('G: auto-saved trip is cleared', auto.distAfter, 0, 0.001);
+
+    await page.reload();
+    const persisted = await page.evaluate(() => window.BoatTrips.list().length);
+    checkEq('G: log survives a reload', persisted, 2);
+
+    await ctx.close();
+  }
+
+  // ------------------------------------------------------------ H. tides
+  //
+  // The NOAA host is unreachable from this environment (blocked by egress
+  // policy), so the HTTP layer is intercepted and answered with generated
+  // NOAA-shaped payloads. Everything downstream of the request is exercised for
+  // real: URL construction, parsing, nearest-station choice, interpolation,
+  // graph geometry, caching and the stale-cache refusal. The live request itself
+  // is NOT covered by this suite.
+  console.log('\n--- H. tides (network intercepted) ---');
+  {
+    const HOUR = 3600000;
+    const PERIOD_H = 12.42;       // one semidiurnal tidal cycle
+    const MEAN_FT = 3.0, AMP_FT = 2.5;
+    const now = Date.now();
+    const firstHigh = now + 1.7 * HOUR;
+
+    const heightAt = (t) =>
+      MEAN_FT + AMP_FT * Math.cos(2 * Math.PI * (t - firstHigh) / (PERIOD_H * HOUR));
+
+    const stamp = (t) => {
+      const d = new Date(t);
+      const p = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+             `${p(d.getHours())}:${p(d.getMinutes())}`;
+    };
+
+    const hourly = [];
+    for (let t = now - 24 * HOUR; t <= now + 48 * HOUR; t += HOUR) {
+      hourly.push({ t: stamp(t), v: heightAt(t).toFixed(3) });
+    }
+    const hilo = [];
+    for (let n = -3; n <= 6; n++) {
+      hilo.push({ t: stamp(firstHigh + n * PERIOD_H * HOUR),
+                  v: (MEAN_FT + AMP_FT).toFixed(3), type: 'H' });
+      hilo.push({ t: stamp(firstHigh + (n + 0.5) * PERIOD_H * HOUR),
+                  v: (MEAN_FT - AMP_FT).toFixed(3), type: 'L' });
+    }
+    hilo.sort((a, b) => new Date(a.t.replace(' ', 'T')) - new Date(b.t.replace(' ', 'T')));
+
+    const STATIONS = { stations: [
+      { id: '8518750', name: 'The Battery, NY', lat: 40.7006, lng: -74.0142 },
+      { id: '8516945', name: 'Kings Point, NY', lat: 40.8103, lng: -73.7649 },
+      { id: '8531680', name: 'Sandy Hook, NJ',  lat: 40.4669, lng: -74.0094 },
+      { id: '8461490', name: 'New London, CT',  lat: 41.3614, lng: -72.0900 }
+    ] };
+
+    const seen = [];
+    const ctx = await browser.newContext({
+      ...IPHONE,
+      permissions: ['geolocation'],
+      geolocation: { latitude: 40.6892, longitude: -74.0445, accuracy: 5 }
+    });
+
+    await ctx.route('**://api.tidesandcurrents.noaa.gov/**', async (route) => {
+      const url = route.request().url();
+      seen.push(url);
+      const body = url.includes('stations.json')
+        ? STATIONS
+        : (url.includes('interval=hilo') ? { predictions: hilo } : { predictions: hourly });
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'access-control-allow-origin': '*' },
+        body: JSON.stringify(body)
+      });
+    });
+
+    const page = await ctx.newPage();
+    page.on('pageerror', e => { failures++; console.log('FAIL  page error:', e.message); });
+    await page.addInitScript(() => {
+      window.__cb = null;
+      navigator.geolocation.watchPosition = function (cb) { window.__cb = cb; return 1; };
+      window.__feed = function (lat, lon, t, acc) {
+        window.__cb({
+          coords: { latitude: lat, longitude: lon, accuracy: acc, speed: null, heading: null },
+          timestamp: t
+        });
+      };
+    });
+    await page.goto(`${BASE}/index.html`);
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    await page.click('#start-btn');
+
+    await page.evaluate(() => window.__feed(40.6892, -74.0445, Date.now(), 5));
+    await page.evaluate(() => window.__speedoApi.ensureTides(true));
+    await page.waitForFunction(() => window.__speedo.tide.bundle !== null, null, { timeout: 15000 })
+      .catch(() => {});
+
+    const tide = await page.evaluate(() => {
+      window.__speedoApi.renderPassage();
+      const b = window.__speedo.tide.bundle;
+      return {
+        stationId: b && b.stationId,
+        stationName: b && b.stationName,
+        hiloCount: b && b.hilo.length,
+        curveCount: b && b.curve.length,
+        height: document.getElementById('tide-height').textContent,
+        trend: document.getElementById('tide-trend').textContent,
+        next: document.getElementById('tide-next').textContent,
+        state: document.getElementById('tide-state').textContent,
+        listItems: document.getElementById('tide-list').children.length,
+        pathPoints: (document.getElementById('tide-line').getAttribute('d') || '')
+          .split(/(?=[ML] )/).filter(Boolean).length,
+        nowX: Number(document.getElementById('tide-nowline').getAttribute('x1')),
+        stationLine: document.getElementById('tide-station-name').textContent,
+        firstX: Number(((document.getElementById('tide-line').getAttribute('d') || '')
+          .match(/^M ([\d.]+)/) || [])[1]),
+        lastX: Number(((document.getElementById('tide-line').getAttribute('d') || '')
+          .match(/L ([\d.]+) [\d.]+$/) || [])[1]),
+        axis: document.getElementById('tide-axis').textContent
+      };
+    });
+    console.log('   tide:', JSON.stringify(tide));
+
+    checkEq('H: nearest station chosen', tide.stationId, '8518750');
+    checkEq('H: station name shown', tide.stationName, 'The Battery, NY');
+    checkEq('H: hi/lo request made', seen.some(u => u.includes('interval=hilo')), true);
+    checkEq('H: hourly request made', seen.some(u => /interval=h(&|$)/.test(u)), true);
+    checkEq('H: request carries the station id',
+      seen.some(u => u.includes('station=8518750')), true);
+    checkEq('H: request asks for MLLW', seen.some(u => u.includes('datum=MLLW')), true);
+
+    // Interpolated height must track the true sinusoid the fixture was built from.
+    check('H: current height interpolated correctly (ft)',
+      Number(tide.height), heightAt(now), 0.06);
+    checkEq('H: trend towards the next high', tide.trend, 'Rising');
+    checkEq('H: next event is a high', tide.next.startsWith('High'), true);
+    checkEq('H: four upcoming events listed', tide.listItems, 4);
+    checkEq('H: station distance shown', tide.stationLine.includes('NM away'), true);
+
+    // 24-hour window at hourly resolution, plus the exact extremes merged in.
+    if (tide.pathPoints < 24 || tide.pathPoints > 32) {
+      failures++;
+      console.log(`FAIL  H: graph point count out of range: ${tide.pathPoints}`);
+    } else {
+      console.log(`PASS  H: graph drawn from ${tide.pathPoints} merged points`);
+    }
+    // The curve is scaled to the data it has, so it must span the full box.
+    check('H: curve starts at the left edge', tide.firstX, 0, 0.01);
+    check('H: curve ends at the right edge', tide.lastX, 300, 0.01);
+    // Window runs from now-6h to now+18h, so "now" sits about a quarter across.
+    if (tide.nowX < 60 || tide.nowX > 90) {
+      failures++;
+      console.log(`FAIL  H: now-line misplaced at x=${tide.nowX}`);
+    } else {
+      console.log(`PASS  H: now-line placed at x=${tide.nowX.toFixed(1)} of 300`);
+    }
+    checkEq('H: axis marks the far end as the next day', tide.axis.includes('+1d'), true);
+
+    // --- cache survives going offline ---
+    await ctx.setOffline(true);
+    await page.reload();
+    await page.click('#start-btn');
+    const offline = await page.evaluate(() => {
+      window.__feed(40.6892, -74.0445, Date.now(), 5);
+      window.__speedoApi.renderPassage();
+      return {
+        hasBundle: window.__speedo.tide.bundle !== null,
+        height: document.getElementById('tide-height').textContent,
+        state: document.getElementById('tide-state').textContent,
+        note: document.getElementById('tide-note').textContent
+      };
+    });
+    console.log('   offline tide:', JSON.stringify(offline));
+    checkEq('H: cached predictions available with no network', offline.hasBundle, true);
+    checkEq('H: height still shown offline', offline.height !== '--', true);
+    await ctx.setOffline(false);
+
+    // --- a cache that does not cover now must refuse to draw ---
+    const stale = await page.evaluate(() => {
+      const b = window.__speedo.tide.bundle;
+      const shift = 5 * 86400000;                       // shove the whole cache into the past
+      b.curve = b.curve.map(p => ({ ...p, t: p.t - shift }));
+      b.hilo = b.hilo.map(p => ({ ...p, t: p.t - shift }));
+      window.__speedoApi.renderPassage();
+      return {
+        state: document.getElementById('tide-state').textContent,
+        line: document.getElementById('tide-line').getAttribute('d'),
+        height: document.getElementById('tide-height').textContent,
+        note: document.getElementById('tide-note').textContent
+      };
+    });
+    checkEq('H: stale cache reports out of date', stale.state, 'OUT OF DATE');
+    checkEq('H: stale cache draws no curve', stale.line, '');
+    checkEq('H: stale cache shows no height', stale.height, '--');
+    checkEq('H: stale cache explains itself',
+      stale.note.includes('do not cover right now'), true);
+
+    // --- pinning a different station refetches against that station ---
+    seen.length = 0;
+    await page.evaluate(() => {
+      window.BoatTides.pinStation('8531680', 'Sandy Hook, NJ');
+      return window.__speedoApi.ensureTides(true);
+    });
+    await page.waitForFunction(
+      () => window.__speedo.tide.bundle && window.__speedo.tide.bundle.stationId === '8531680',
+      null, { timeout: 15000 }
+    ).catch(() => {});
+    const pinned = await page.evaluate(() => window.__speedo.tide.bundle.stationId);
+    checkEq('H: pinned station is used', pinned, '8531680');
+    checkEq('H: refetch targets the pinned station',
+      seen.some(u => u.includes('station=8531680')), true);
+
+    await ctx.close();
+  }
+
+  // ------------------------------------------------------- I. tide failures
+  console.log('\n--- I. tide failure handling ---');
+  {
+    const ctx = await browser.newContext({
+      ...IPHONE,
+      permissions: ['geolocation'],
+      geolocation: { latitude: 40.6892, longitude: -74.0445, accuracy: 5 }
+    });
+    // Simulate the browser refusing the cross-origin request, which is the most
+    // likely real-world failure and must not look like "no tides here".
+    await ctx.route('**://api.tidesandcurrents.noaa.gov/**', route => route.abort('failed'));
+
+    const page = await ctx.newPage();
+    await page.addInitScript(() => {
+      navigator.geolocation.watchPosition = function (cb) { window.__cb = cb; return 1; };
+      window.__feed = function (lat, lon, t, acc) {
+        window.__cb({ coords: { latitude: lat, longitude: lon, accuracy: acc,
+                                speed: null, heading: null }, timestamp: t });
+      };
+    });
+    await page.goto(`${BASE}/index.html`);
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    await page.click('#start-btn');
+    await page.evaluate(() => window.__feed(40.6892, -74.0445, Date.now(), 5));
+    await page.evaluate(() => window.__speedoApi.ensureTides(true));
+    await page.waitForFunction(() => window.__speedo.tide.busy === false, null, { timeout: 15000 })
+      .catch(() => {});
+
+    const failed = await page.evaluate(() => ({
+      error: window.__speedo.tide.error,
+      note: document.getElementById('tide-note').textContent,
+      state: document.getElementById('tide-state').textContent
+    }));
+    console.log('   failure:', JSON.stringify(failed));
+    checkEq('I: fetch failure is surfaced', typeof failed.error, 'string');
+    checkEq('I: CORS named as the likely cause', failed.note.includes('CORS'), true);
+    checkEq('I: card reports no data', failed.state, 'NO DATA');
+
     await ctx.close();
   }
 

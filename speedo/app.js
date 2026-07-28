@@ -17,6 +17,12 @@
   var STALE_MS        = 8000;   // no fix for this long => show zero, not a stale number
   var COG_MIN_KN      = 1.0;    // GPS course is meaningless below this
 
+  var SPARK_WINDOW_MS = 10 * 60 * 1000;  // sparkline covers the last ten minutes
+  var SPARK_STEP_MS   = 2000;            // one sample every two seconds
+  var SPARK_FLOOR_KN  = 5;               // never scale below this, or drift looks dramatic
+  var AUTOSAVE_STOP_MS = 20 * 60 * 1000; // stopped this long ends the trip by itself
+  var TIDE_REFRESH_MS = 6 * 3600 * 1000; // re-fetch predictions this often when online
+
   var STORE_KEY = 'boat-speedo/v1';
 
   // ---------------------------------------------------------------- state
@@ -29,15 +35,20 @@
     fixAt: null,
     cog: null,            // degrees 0-359
     cogSource: 'COG',
-    trip: { distM: 0, maxMs: 0, movingMs: 0 },
+    trip: { distM: 0, maxMs: 0, movingMs: 0, startedAt: null },
     anchor: null,         // { lat, lon }
     anchorRadius: 30,
     noWakeKn: 5,
     noWakeArmed: false,
     night: false,
+    autoNight: false,
+    lastAutoDark: null,   // last state auto-night applied, so a manual flip sticks
     alarm: null,          // 'anchor' | 'nowake'
     acked: false,         // alarm silenced by the user until it clears
-    dialMaxKn: DIAL_MIN_MAX_KN
+    dialMaxKn: DIAL_MIN_MAX_KN,
+    spark: [],            // [{ t, ms }]
+    stoppedSince: null,   // when the boat last came to rest
+    tide: { bundle: null, stations: null, busy: false, error: null, triedAt: 0 }
   };
 
   var el = {};
@@ -45,11 +56,19 @@
     'fix-dot', 'fix-label', 'accuracy', 'fix-age', 'wake-dot', 'wake-label',
     'dial-value', 'needle', 'ticks', 'kn', 'mph', 'rose', 'rose-ticks', 'cog', 'cog-src',
     'dist', 'max', 'avg', 'elapsed',
+    'spark-svg', 'spark-line', 'spark-area', 'spark-peak', 'spark-span',
     'anchor-panel', 'anchor-state', 'anchor-radius', 'anchor-radius-out', 'anchor-btn',
     'drift', 'drift-fill', 'drift-wrap',
     'nowake-panel', 'nowake-state', 'nowake-limit', 'nowake-limit-out', 'nowake-btn',
-    'night-btn', 'compass-btn', 'reset-btn',
+    'night-btn', 'compass-btn', 'endtrip-btn',
     'alarm-banner', 'alarm-text', 'alarm-ack',
+    'screens', 'dots',
+    'tide-state', 'tide-station-name', 'tide-change', 'tide-height', 'tide-trend',
+    'tide-next', 'tide-area', 'tide-line', 'tide-nowline', 'tide-markers', 'tide-axis',
+    'tide-list', 'tide-note', 'tide-picker', 'tide-stations', 'tide-station-id',
+    'tide-station-set', 'tide-refresh',
+    'sun-state', 'sunrise', 'sunset', 'daylen', 'dawn', 'dusk', 'noon', 'autonight',
+    'log-state', 'log-list', 'log-totals', 'log-export', 'log-clear',
     'gate', 'gate-err', 'start-btn'
   ].forEach(function (id) {
     el[id] = document.getElementById(id);
@@ -89,7 +108,8 @@
         anchorRadius: state.anchorRadius,
         noWakeKn: state.noWakeKn,
         noWakeArmed: state.noWakeArmed,
-        night: state.night
+        night: state.night,
+        autoNight: state.autoNight
       }));
     } catch (e) { /* private mode / quota — the app still works, it just forgets */ }
   }
@@ -105,12 +125,14 @@
       state.trip.distM   = s.trip.distM   || 0;
       state.trip.maxMs   = s.trip.maxMs   || 0;
       state.trip.movingMs = s.trip.movingMs || 0;
+      state.trip.startedAt = s.trip.startedAt || null;
     }
     if (s.anchor && typeof s.anchor.lat === 'number') state.anchor = s.anchor;
     if (typeof s.anchorRadius === 'number') state.anchorRadius = s.anchorRadius;
     if (typeof s.noWakeKn === 'number') state.noWakeKn = s.noWakeKn;
     state.noWakeArmed = !!s.noWakeArmed;
     state.night = !!s.night;
+    state.autoNight = !!s.autoNight;
   }
 
   // ---------------------------------------------------------------- audio
@@ -305,6 +327,10 @@
       ? '--'
       : Math.min(999, Math.round((Date.now() - state.fixAt) / 1000)) + 's ago';
 
+    var now = Date.now();
+    if (state.started) pushSpark(now, ms);
+    renderSpark(now);
+
     renderAnchor();
     renderNoWake();
   }
@@ -342,6 +368,373 @@
   function currentDrift() {
     if (!state.anchor || !state.prev) return null;
     return haversine(state.anchor.lat, state.anchor.lon, state.prev.lat, state.prev.lon);
+  }
+
+  // ---------------------------------------------------------------- sparkline
+
+  var lastSparkAt = 0;
+
+  function pushSpark(now, ms) {
+    if (now - lastSparkAt < SPARK_STEP_MS) return;
+    lastSparkAt = now;
+    state.spark.push({ t: now, ms: ms });
+    var cutoff = now - SPARK_WINDOW_MS;
+    while (state.spark.length && state.spark[0].t < cutoff) state.spark.shift();
+  }
+
+  function renderSpark(now) {
+    var pts = state.spark;
+    if (pts.length < 2) {
+      el['spark-line'].setAttribute('d', '');
+      el['spark-area'].setAttribute('d', '');
+      el['spark-peak'].textContent = '0.0';
+      return;
+    }
+
+    var W = 300, H = 40;
+    var peakMs = 0;
+    for (var i = 0; i < pts.length; i++) if (pts[i].ms > peakMs) peakMs = pts[i].ms;
+
+    // Scale to the window's own peak, with a floor so a slow drift does not render
+    // as dramatic mountains.
+    var peakKn = Math.max(SPARK_FLOOR_KN, peakMs * KN_PER_MS);
+
+    // Span the box with whatever we have. In the first ten minutes after starting
+    // there is less than a full window, and squeezing it against the right-hand
+    // edge looks like a broken graph rather than a young one.
+    var from = pts[0].t;
+    var to = pts[pts.length - 1].t;
+    if (to - from < 1000) { to = from + 1000; }
+    var span = to - from;
+
+    var d = '';
+    for (var j = 0; j < pts.length; j++) {
+      var x = (pts[j].t - from) / span * W;
+      var y = H - (pts[j].ms * KN_PER_MS / peakKn) * (H - 2);
+      d += (j === 0 ? 'M ' : 'L ') + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+    }
+
+    var firstX = '0.0';
+    var lastX = W.toFixed(1);
+
+    var spanMin = Math.round(span / 60000);
+    el['spark-span'].textContent = spanMin >= 1
+      ? 'last ' + spanMin + ' min'
+      : 'last ' + Math.round(span / 1000) + ' s';
+
+    el['spark-line'].setAttribute('d', d.trim());
+    el['spark-area'].setAttribute('d', d + 'L ' + lastX + ' ' + H + ' L ' + firstX + ' ' + H + ' Z');
+    el['spark-peak'].textContent = (peakMs * KN_PER_MS).toFixed(1);
+  }
+
+  // ---------------------------------------------------------------- sun
+
+  function renderSun() {
+    if (!state.prev) {
+      el['sun-state'].textContent = 'NEEDS A FIX';
+      return;
+    }
+    var t = window.BoatSun.times(state.prev.lat, state.prev.lon, new Date());
+    el.sunrise.textContent = window.BoatSun.fmt(t.sunrise);
+    el.sunset.textContent = window.BoatSun.fmt(t.sunset);
+    el.dawn.textContent = window.BoatSun.fmt(t.civilDawn);
+    el.dusk.textContent = window.BoatSun.fmt(t.civilDusk);
+    el.noon.textContent = window.BoatSun.fmt(t.solarNoon);
+    el.daylen.textContent = t.polar === 'day' ? '24h'
+                          : (t.polar === 'night' ? '0h' : window.BoatSun.fmtDuration(t.dayLengthMin));
+    el['sun-state'].textContent = t.polar === 'day' ? 'MIDNIGHT SUN'
+                                : (t.polar === 'night' ? 'POLAR NIGHT' : 'LOCAL TIME');
+  }
+
+  /* Flip the palette at sunrise and sunset. A manual tap wins until the next
+     transition, rather than being undone a second later. */
+  function applyAutoNight() {
+    if (!state.autoNight || !state.prev) return;
+    var dark = window.BoatSun.isDark(state.prev.lat, state.prev.lon, new Date());
+    if (dark === state.lastAutoDark) return;
+    state.lastAutoDark = dark;
+    if (state.night !== dark) {
+      state.night = dark;
+      applyNight();
+      save();
+    }
+  }
+
+  // ---------------------------------------------------------------- tides
+
+  function tideStatus(text, cls) {
+    el['tide-state'].textContent = text;
+    el['tide-state'].className = 'card__state' + (cls ? ' ' + cls : '');
+  }
+
+  function note(text, warn) {
+    el['tide-note'].textContent = text || '';
+    el['tide-note'].className = 'card__note' + (warn ? ' is-warn' : '');
+  }
+
+  function hhmm(ms) {
+    var d = new Date(ms);
+    return String(d.getHours()).padStart(2, '0') + ':' +
+           String(d.getMinutes()).padStart(2, '0');
+  }
+
+  /* Collapse the readout, graph, axis and list together. Showing an empty graph
+     frame with nothing in it reads as a broken app rather than as missing data. */
+  function showTideDetail(show) {
+    ['tide-now-wrap', 'tide-axis', 'tide-list'].forEach(function (id) {
+      el[id] = el[id] || document.getElementById(id);
+      if (el[id]) el[id].hidden = !show;
+    });
+    var graph = document.getElementById('tide-graph');
+    if (graph) graph.hidden = !show;
+  }
+
+  function renderTide() {
+    var T = window.BoatTides;
+    var bundle = state.tide.bundle;
+    var now = Date.now();
+
+    if (state.tide.busy) tideStatus('FETCHING…');
+
+    if (!bundle) {
+      if (!state.tide.busy) tideStatus('NO DATA', 'is-warn');
+      el['tide-station-name'].textContent = 'No station yet';
+      showTideDetail(false);
+      note(state.tide.error
+        ? state.tide.error
+        : 'Tides cannot be computed offline. Connect once with a signal and the '
+          + 'predictions are cached for several days.', !!state.tide.error);
+      return;
+    }
+
+    el['tide-station-name'].textContent = bundle.stationName +
+      (bundle.distanceM != null
+        ? ' · ' + (bundle.distanceM / 1852).toFixed(1) + ' NM away'
+        : '');
+
+    var covers = T.coversNow(bundle, now);
+    if (!covers) {
+      if (!state.tide.busy) tideStatus('OUT OF DATE', 'is-warn');
+      note('The cached predictions do not cover right now, so no graph is drawn — '
+         + 'a stale tide curve is worse than none. Connect and refresh.', true);
+      showTideDetail(false);
+      el['tide-line'].setAttribute('d', '');
+      el['tide-area'].setAttribute('d', '');
+      el['tide-markers'].innerHTML = '';
+      el['tide-list'].innerHTML = '';
+      el['tide-height'].textContent = '--';
+      el['tide-trend'].textContent = '—';
+      el['tide-next'].textContent = '—';
+      return;
+    }
+
+    showTideDetail(true);
+
+    var ageH = (now - bundle.fetchedAt) / 3600000;
+    if (!state.tide.busy) {
+      tideStatus(ageH < 1 ? 'UP TO DATE' : 'CACHED', ageH < 12 ? 'is-ok' : '');
+    }
+    note(ageH < 1
+      ? 'Predicted heights above MLLW, station local time.'
+      : 'Cached ' + (ageH < 24
+          ? Math.round(ageH) + ' h ago'
+          : Math.round(ageH / 24) + ' d ago') + '. Predicted heights above MLLW.');
+
+    // now readout
+    var h = T.heightAt(bundle, now);
+    el['tide-height'].textContent = h == null ? '--' : h.toFixed(1);
+    var trend = T.trendAt(bundle, now);
+    el['tide-trend'].textContent = trend === 'rising' ? 'Rising'
+                                 : (trend === 'falling' ? 'Falling' : '—');
+
+    var next = T.nextEvent(bundle, now);
+    if (next) {
+      var mins = Math.round((next.t - now) / 60000);
+      el['tide-next'].textContent =
+        (next.type === 'H' ? 'High' : 'Low') + ' ' + next.v.toFixed(1) + ' ft at ' +
+        hhmm(next.t) + ' · in ' + (mins >= 60
+          ? Math.floor(mins / 60) + 'h ' + String(mins % 60).padStart(2, '0') + 'm'
+          : mins + 'm');
+    } else {
+      el['tide-next'].textContent = '—';
+    }
+
+    // graph
+    var win = T.window24(bundle, now);
+    var geo = T.geometry(win, 300, 110, 6);
+    if (!geo) {
+      el['tide-line'].setAttribute('d', '');
+      el['tide-area'].setAttribute('d', '');
+      el['tide-axis'].innerHTML = '';
+    } else {
+      el['tide-line'].setAttribute('d', geo.d);
+      el['tide-area'].setAttribute('d', geo.area);
+      var nx = geo.x(now).toFixed(2);
+      el['tide-nowline'].setAttribute('x1', nx);
+      el['tide-nowline'].setAttribute('x2', nx);
+
+      var marks = '';
+      bundle.hilo.forEach(function (p) {
+        if (p.t < win.from || p.t > win.to) return;
+        var x = geo.x(p.t), y = geo.y(p.v);
+        marks += '<line class="tide__mark-tick" x1="' + x.toFixed(2) + '" y1="' + y.toFixed(2) +
+                 '" x2="' + x.toFixed(2) + '" y2="' + (y + (p.type === 'H' ? -7 : 7)).toFixed(2) +
+                 '" stroke="currentColor" stroke-width="1.5" vector-effect="non-scaling-stroke"/>';
+      });
+      el['tide-markers'].innerHTML = marks;
+
+      // Over a 24-hour window both ends land on the same clock time, so say which
+      // day the right-hand one is.
+      var sameDay = new Date(geo.tFrom).getDate() === new Date(geo.tTo).getDate();
+      el['tide-axis'].innerHTML =
+        '<span>' + hhmm(geo.tFrom) + '</span><span>now</span>' +
+        '<span>' + hhmm(geo.tTo) + (sameDay ? '' : ' +1d') + '</span>';
+    }
+
+    // upcoming highs and lows
+    var upcoming = bundle.hilo.filter(function (p) { return p.t > now - 3600000; }).slice(0, 4);
+    el['tide-list'].innerHTML = upcoming.map(function (p) {
+      return '<li class="' + (p.type === 'H' ? 'is-high' : 'is-low') + '">' +
+             '<span>' + (p.type === 'H' ? 'High' : 'Low') + ' ' + hhmm(p.t) + '</span>' +
+             '<span>' + p.v.toFixed(1) + ' ft</span></li>';
+    }).join('');
+  }
+
+  function renderStationPicker() {
+    var list = state.tide.stations;
+    if (!list) { el['tide-stations'].innerHTML = '<li class="tide__empty">Needs a signal once.</li>'; return; }
+    var pinned = window.BoatTides.pinnedStationId();
+    el['tide-stations'].innerHTML = list.map(function (s) {
+      return '<li><button type="button" data-station="' + s.id + '" data-name="' +
+             s.name.replace(/"/g, '&quot;') + '"' +
+             (s.id === pinned ? ' class="is-on"' : '') + '>' +
+             '<span>' + s.name + '</span>' +
+             '<span class="dist">' + (s.distanceM / 1852).toFixed(1) + ' NM</span>' +
+             '</button></li>';
+    }).join('');
+  }
+
+  /* Pick a station and fetch, but only when there is a plausible reason to: no
+     cache, a different station, stale data, or the user asked. */
+  function ensureTides(force) {
+    var T = window.BoatTides;
+    if (state.tide.busy || !state.prev) return Promise.resolve();
+    if (navigator.onLine === false && !force) return Promise.resolve();
+
+    var bundle = state.tide.bundle;
+    var fresh = bundle &&
+                (Date.now() - bundle.fetchedAt) < TIDE_REFRESH_MS &&
+                T.coversNow(bundle, Date.now()) &&
+                (!T.pinnedStationId() || T.pinnedStationId() === bundle.stationId);
+    if (fresh && !force) return Promise.resolve();
+
+    // Do not hammer a failing network on every fix.
+    if (!force && Date.now() - state.tide.triedAt < 60000) return Promise.resolve();
+    state.tide.triedAt = Date.now();
+    state.tide.busy = true;
+    state.tide.error = null;
+    renderTide();
+
+    return T.loadStations().then(function (stations) {
+      state.tide.stations = T.nearest(stations, state.prev.lat, state.prev.lon, 8);
+      renderStationPicker();
+
+      var pinned = T.pinnedStationId();
+      var chosen = null;
+      if (pinned) {
+        for (var i = 0; i < stations.length; i++) {
+          if (stations[i].id === pinned) {
+            chosen = {
+              id: stations[i].id, name: stations[i].name,
+              distanceM: T.haversine(state.prev.lat, state.prev.lon,
+                                     stations[i].lat, stations[i].lon)
+            };
+            break;
+          }
+        }
+        if (!chosen) chosen = { id: pinned, name: 'Station ' + pinned, distanceM: null };
+      } else {
+        chosen = state.tide.stations[0];
+      }
+      if (!chosen) throw new Error('no station found near you');
+      return T.fetchPredictions(chosen);
+    }).then(function (bundle) {
+      state.tide.bundle = bundle;
+      state.tide.busy = false;
+      renderTide();
+    }).catch(function (err) {
+      state.tide.busy = false;
+      state.tide.error = tideErrorText(err);
+      renderTide();
+    });
+  }
+
+  function tideErrorText(err) {
+    var msg = (err && err.message) || String(err);
+    if (/Failed to fetch|NetworkError|Load failed/i.test(msg)) {
+      return 'Could not reach the tide service. If you have a signal, this is most '
+           + 'likely the browser blocking a cross-origin request (CORS).';
+    }
+    return 'Tide fetch failed: ' + msg;
+  }
+
+  // ---------------------------------------------------------------- trip log
+
+  function renderLog() {
+    var trips = window.BoatTrips.list();
+    el['log-state'].textContent = trips.length
+      ? trips.length + (trips.length === 1 ? ' TRIP' : ' TRIPS')
+      : 'NO TRIPS';
+
+    el['log-list'].innerHTML = trips.map(function (t) {
+      return '<li class="log__row" data-id="' + t.id + '">' +
+             '<span class="log__when">' + window.BoatTrips.when(t) + '</span>' +
+             '<span class="log__stats"><b>' + window.BoatTrips.nm(t.distM) + ' NM</b> · ' +
+             window.BoatTrips.duration(t.movingMs) + ' · ' +
+             window.BoatTrips.knots(window.BoatTrips.avgMs(t)) + ' avg · ' +
+             window.BoatTrips.knots(t.maxMs) + ' max</span>' +
+             '<button type="button" class="log__del" data-del="' + t.id +
+             '" aria-label="Delete trip">&times;</button></li>';
+    }).join('');
+
+    var tot = window.BoatTrips.totals();
+    el['log-totals'].hidden = tot.count === 0;
+    el['log-totals'].textContent = tot.count
+      ? tot.count + ' trips · ' + window.BoatTrips.nm(tot.distM) + ' NM · ' +
+        window.BoatTrips.duration(tot.movingMs) + ' under way · ' +
+        window.BoatTrips.knots(tot.maxMs) + ' kn best'
+      : '';
+  }
+
+  function endTrip(auto) {
+    var saved = window.BoatTrips.add(state.trip, Date.now());
+    state.trip = { distM: 0, maxMs: 0, movingMs: 0, startedAt: null };
+    state.stoppedSince = null;
+    state.dialMaxKn = DIAL_MIN_MAX_KN;
+    buildTicks(state.dialMaxKn);
+    renderLog();
+    render();
+    save();
+    if (!auto && !saved) {
+      // Be honest that nothing was filed rather than silently zeroing.
+      el['log-state'].textContent = 'TOO SHORT TO LOG';
+    }
+    return saved;
+  }
+
+  /* Safety net: a run that has been stopped for twenty minutes is over, whether
+     or not anyone remembered to tap END TRIP. */
+  function maybeAutoSave(now) {
+    if (!window.BoatTrips.isLoggable(state.trip)) return;
+    if (state.stoppedSince == null) return;
+    if (now - state.stoppedSince < AUTOSAVE_STOP_MS) return;
+    endTrip(true);
+  }
+
+  function renderPassage() {
+    renderSun();
+    renderTide();
+    renderLog();
   }
 
   // ---------------------------------------------------------------- alarms
@@ -426,8 +819,18 @@
           state.cogSource = 'COG';
         }
       }
-      if (dtS && state.speedMs * KN_PER_MS >= MOVING_KN) state.trip.movingMs += dtS * 1000;
+      var underWay = state.speedMs * KN_PER_MS >= MOVING_KN;
+      if (dtS && underWay) state.trip.movingMs += dtS * 1000;
       if (state.speedMs > state.trip.maxMs) state.trip.maxMs = state.speedMs;
+
+      // A trip starts the first time the boat actually moves, not when the app
+      // was opened, so the log shows time under way rather than time on the dock.
+      if (underWay) {
+        if (state.trip.startedAt == null) state.trip.startedAt = Date.now();
+        state.stoppedSince = null;
+      } else if (state.stoppedSince == null) {
+        state.stoppedSince = Date.now();
+      }
 
       state.prev = { lat: c.latitude, lon: c.longitude, t: t };
     }
@@ -564,13 +967,84 @@
     enableCompass();
   });
 
-  el['reset-btn'].addEventListener('click', function () {
-    state.trip = { distM: 0, maxMs: 0, movingMs: 0 };
-    state.dialMaxKn = DIAL_MIN_MAX_KN;
-    buildTicks(state.dialMaxKn);
-    render();
+  el['endtrip-btn'].addEventListener('click', function () { endTrip(false); });
+
+  // ---------------------------------------------------------------- passage controls
+
+  el.autonight.addEventListener('change', function () {
+    state.autoNight = this.checked;
+    state.lastAutoDark = null;      // apply immediately rather than at the next transition
+    applyAutoNight();
     save();
   });
+
+  el['tide-refresh'].addEventListener('click', function () { ensureTides(true); });
+
+  el['tide-change'].addEventListener('click', function () {
+    el['tide-picker'].hidden = !el['tide-picker'].hidden;
+    if (!el['tide-picker'].hidden) renderStationPicker();
+  });
+
+  el['tide-stations'].addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-station]');
+    if (!btn) return;
+    window.BoatTides.pinStation(btn.getAttribute('data-station'), btn.getAttribute('data-name'));
+    el['tide-picker'].hidden = true;
+    ensureTides(true);
+  });
+
+  el['tide-station-set'].addEventListener('click', function () {
+    var id = el['tide-station-id'].value.trim();
+    if (!id) return;
+    window.BoatTides.pinStation(id, 'Station ' + id);
+    el['tide-picker'].hidden = true;
+    ensureTides(true);
+  });
+
+  el['log-list'].addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-del]');
+    if (!btn) return;
+    window.BoatTrips.remove(btn.getAttribute('data-del'));
+    renderLog();
+  });
+
+  el['log-export'].addEventListener('click', function () {
+    if (!window.BoatTrips.list().length) { el['log-state'].textContent = 'NOTHING TO EXPORT'; return; }
+    window.BoatTrips.exportCSV();
+  });
+
+  el['log-clear'].addEventListener('click', function () {
+    if (!window.BoatTrips.list().length) return;
+    // Two taps to wipe the log — one stray touch should not delete a season.
+    if (el['log-clear'].dataset.armed === '1') {
+      window.BoatTrips.clear();
+      delete el['log-clear'].dataset.armed;
+      el['log-clear'].textContent = 'CLEAR LOG';
+      el['log-clear'].classList.remove('is-on');
+      renderLog();
+    } else {
+      el['log-clear'].dataset.armed = '1';
+      el['log-clear'].textContent = 'TAP AGAIN';
+      el['log-clear'].classList.add('is-on');
+      setTimeout(function () {
+        delete el['log-clear'].dataset.armed;
+        el['log-clear'].textContent = 'CLEAR LOG';
+        el['log-clear'].classList.remove('is-on');
+      }, 4000);
+    }
+  });
+
+  // ---------------------------------------------------------------- screens
+
+  el.screens.addEventListener('scroll', function () {
+    var idx = Math.round(el.screens.scrollLeft / el.screens.clientWidth);
+    var dots = el.dots.children;
+    for (var i = 0; i < dots.length; i++) {
+      dots[i].classList.toggle('is-on', i === idx);
+    }
+    // Refresh the passage screen as it comes into view rather than every tick.
+    if (idx === 1) renderPassage();
+  }, { passive: true });
 
   function applyNight() {
     document.body.classList.toggle('night', state.night);
@@ -621,11 +1095,36 @@
   el['anchor-radius-out'].textContent = state.anchorRadius + ' m';
   el['nowake-limit'].value = state.noWakeKn;
   el['nowake-limit-out'].textContent = state.noWakeKn.toFixed(1) + ' kn';
+  el.autonight.checked = state.autoNight;
+  state.tide.bundle = window.BoatTides.cached();
   render();
+  renderPassage();
+
+  /* Publish the dial's rendered width so the readout inside it can be sized from
+     the dial rather than from the viewport — the dial flexes, the viewport does not. */
+  (function trackDialSize() {
+    var svg = document.querySelector('.dial');
+    if (!svg) return;
+    function apply() {
+      var w = svg.getBoundingClientRect().width;
+      if (w > 0) document.documentElement.style.setProperty('--dial', w + 'px');
+    }
+    if (window.ResizeObserver) new ResizeObserver(apply).observe(svg);
+    window.addEventListener('resize', apply);
+    apply();
+  })();
 
   // Keep the fix-age counter and stale-speed handling honest between fixes.
+  var lastPassageAt = 0;
   setInterval(function () {
-    if (state.started) { checkAlarms(); render(); }
+    if (!state.started) return;
+    var now = Date.now();
+    checkAlarms();
+    render();
+    maybeAutoSave(now);
+    applyAutoNight();
+    ensureTides(false);
+    if (now - lastPassageAt > 10000) { lastPassageAt = now; renderPassage(); }
   }, 1000);
 
   if ('serviceWorker' in navigator) {
@@ -636,4 +1135,14 @@
 
   // Exposed for the automated test harness.
   window.__speedo = state;
+  window.__speedoApi = {
+    endTrip: endTrip,
+    ensureTides: ensureTides,
+    renderPassage: renderPassage,
+    maybeAutoSave: maybeAutoSave,
+    applyAutoNight: applyAutoNight,
+    pushSpark: pushSpark,
+    renderSpark: renderSpark,
+    resetSparkClock: function () { lastSparkAt = 0; }
+  };
 })();
