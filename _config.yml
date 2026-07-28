@@ -53,7 +53,3 @@ exclude:
 - node_modules
 - gulpfile.js
 - package.json
-# Source for the standalone Boat Speedo apps. speedo/ itself is published as
-# plain static files; these two are development-only and must not ship.
-- speedo/test
-- ios
